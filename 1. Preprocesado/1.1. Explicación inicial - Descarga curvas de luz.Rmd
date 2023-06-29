@@ -1,0 +1,389 @@
+---
+title: "Descarga y depuración de curvas de luz"
+description: |
+  Barbara A. Mikulski Archive for Space Telescopes y NASA Exoplanet Archive
+author:
+  - name: Iván González Martín
+    affiliation: Universidad Complutense de Madrid
+    affiliation_url: https://ucm.es
+date: "`r Sys.Date()`"
+output:
+    distill::distill_article:
+        highlight: kate
+        colorlinks: true
+        code_folding: false
+        toc: true            
+        toc_depth: 3     
+editor_options: 
+  markdown: 
+    wrap: sentence
+---
+
+```{r setup, include = FALSE}
+knitr::opts_chunk$set(message = FALSE, warning = FALSE,
+                      echo = TRUE, res = 400)
+```
+
+# Paquetes
+
+```{r paquetes}
+rm(list = ls())
+
+# Paquetes
+library(tidymodels)
+library(tidyverse)
+library(FITSio) # Tratamiento y transformación de archivos FITSio
+```
+
+# Objetivo
+
+El objetivo de este archivo es descargar y depurar las curvas de luz de larga cadencia de todas las estrellas observadas por el telescopio espacial Kepler durante los cuatro años que estuvo activo (2009 - 2013).
+
+# Descarga del listado de estrellas
+
+En el Mikulski Archive for Space Telescopes (MAST) se recopilan todas las curvas de luz de todas las estrellas observadas por todas los telescopios espaciales que se han ido lanzando al espacio.
+Nosotros solo necesitamos recopilar información de las cerca de 17 000 estrellas que se encargó de monitorear Kepler en sus cuatro años de actividad, por lo que, en primer lugar, deberemos disponer de sus IDs estelares (concretamente, sus KepIDs).
+
+Esta tarea es bastante sencilla. Tan solo deberemos dirigirnos a la página oficial de la NASA dedicada a la identificación de exoplanetas (NASA Exoplanet Archive) para localizar sus identificadores.
+Los listados de estrellas monitoreadas están clasificadas según el telescopio espacial que las identificó en primera instancia, por lo que la tarea es realmente sencilla.
+
+Por el momento, de todas las misiones espaciales para el posicionamiento de telescopios espaciales, la única que tiene sus datos ya etiquetados es la de Kepler (la primera de todas).
+Es por ello que la hemos seleccionado para este trabajo.
+
+```{r}
+TCEs <- 
+  read_delim("/Users/leztin/Library/Mobile Documents/com~apple~CloudDocs/Universidad/Máster/TFM/TCEs/TCEs.csv"
+             , delim = ";")
+```
+
+A las curvas de luz de este conjunto de estrellas se les denomina Threshold-Crossing Events (TCEs) o Eventos de Cruce de Umbral.
+En esencia, son mediciones de la intensidad de luz de estrellas en las que se producen valles lo suficientemente prominentes como para pasar a ser investigados de una manera más pormenorizada.
+
+La base de datos de la NASA almacena muchísima información sobre estas estrellas.
+Para el objeto que nos ocupa tan solo necesitaremos información de unas cuantas variables.
+En concreto, se han seleccionado las siguientes:
+
+-   **rowid:** Integer ID of the row in the TCE table.
+-   **kepid:** Kepler ID of the target star.
+-   **tce_plnt_num:** TCE number within the target star.
+-   **tce_period:** Period of the detected event, in days.
+-   **tce_time0bk:** The time corresponding to the center of the first detected event in Barycentric Julian Day (BJD) minus a constant offset of 2,454,833.0 days.
+-   **tce_duration:** Duration of the detected event, in hours.
+-   **Autovetter training set label:** PC (planet candidate), AFP (astrophysical false positive), NTP (non-transiting phenomenon) and UNK (unknown).
+
+```{r}
+TCEs |> 
+  count(av_training_set)
+```
+
+En el dataset tenemos tan solo datos de 3600 planetas candidatos que orbitan la misma o distintas estrellas. El resto se podrían considerar, en un problema de clasificación clásico, datos de la clase negativa. En la mayoría de artículos se generan curvas de luz con TCEs sintéticos para engrosar la clase positiva. Podríamos también deshacernos directamente de tuplas con la etiqueta UNK. Ya veremos.
+
+```{r}
+TCEs |> 
+  count(kepid)
+```
+
+Además, hay  que tener en cuenta que cada fila responde a un posible planeta identificado (TCE), y no a una estrella. A pesar de disponer de una muestra de 20 367 observaciones, en realidad el dataset cuenta únicamente con ID's de 12 669 estrellas. Recordemos que una estrella puede ser orbitada por más de un exoplaneta.
+
+## Primera posible aproximación: Órbitas inferiores a 30 días
+
+Recordemos que los datos de Kepler se componen por mediciones de flujo de **150 000 estrellas tomadas cada 30 minutos a lo largo de 4 años**. Estas mediciones se encuentran segmentadas en trimestres de aproximadamente 90 días de duración, sumando un total de 18 trimestres y más de 70 000 observaciones totales por cada estrella. De estas 200 000 estrellas, nosotros ya preseleccionamos únicamente 12 669 estrellas. Aún con todo, nos quedaría un dataset con datos de series temporales por estrella del orden de los 900 000 000 de puntos individuales de información.
+
+En el caso de que se considere un único trimestre por estrella, los puntos de información que compondrían las series temporales se reducirían sustancialmente: en torno a 4100 por estrella. En total, 52 000 000 de puntos individuales para 12 669 estrellas.
+
+En el caso de que se opte por esta opción, esto es, que no se utilicen todas las curvas de luz de todos los trimestres, se propone filtrar aquellos astros con un periodo orbital inferior a los 30 días. Un trimestre tiene cerca de 91 días. **Se hace para que en cada curva de luz haya al menos tres TCEs de los que pueda aprender el modelo**.
+
+```{r}
+TCE_filt <-
+  TCEs |> 
+  filter(tce_period < 30)
+
+TCE_filt |> 
+  count(av_training_set)
+
+TCE_filt |> 
+  count(kepid)
+```
+
+## Segunda posible aproximación: Combinar todos los trimestres en una única serie temporal
+
+Otra posible aproximación en la que tengan cabida todos los datos disponibles sería descargar todas las curvas de luz de larga cadencia de todos los trimestres para cada una de las 12 669 estrellas, y unirlas en series temporales de más de 70 000 datos por estrella. En este caso, conservaríamos toda la información en series temporales cuyo identificador sería el KepID de cada estrella.
+
+**De momento, seguiremos esta aproximación**.
+
+# Descarga de las curvas de luz desde el MAST
+
+Para la descarga de los archivos FITS con las curvas de luz trimestrales asociadas a cada estrella deberemos pasarle a la base de datos MAST (Mikulski Archive for Space Telescopes) un archivo TXT con los KepID de las estrellas que necesitamos. El buscador de la base de datos solo admite un máximo de 500 KepID por query, por lo que tendremos que hacer unos 26 grupos de 500 estrellas cada uno para cada una de las consultas.
+
+```{r eval = FALSE}
+TCEs |> 
+  select(kepid) |> 
+  unique()
+
+TCE_filt <- TCEs |> 
+  select(kepid) |> 
+  unique()
+
+TCE_filt <-
+  sort(TCE_filt$kepid) |> 
+  as_tibble() |> 
+  filter(value > 3120355) # Ya tenía descargados los anteriores al ID 3120355
+
+TCE_filt1 <- TCE_filt[1:500,]
+TCE_filt2 <- TCE_filt[501:1000,]
+TCE_filt3 <- TCE_filt[1001:1500,]
+TCE_filt4 <- TCE_filt[1501:2000,]
+TCE_filt5 <- TCE_filt[2001:2500,]
+TCE_filt6 <- TCE_filt[2501:3000,]
+TCE_filt7 <- TCE_filt[3001:3500,]
+TCE_filt8 <- TCE_filt[3501:4000,]
+TCE_filt9 <- TCE_filt[4001:4500,]
+TCE_filt10 <- TCE_filt[4501:5000,]
+TCE_filt11 <- TCE_filt[5001:5500,]
+TCE_filt12 <- TCE_filt[5501:6000,]
+TCE_filt13 <- TCE_filt[6001:6500,]
+TCE_filt14 <- TCE_filt[6501:7000,]
+TCE_filt15 <- TCE_filt[7001:7500,]
+TCE_filt16 <- TCE_filt[7501:8000,]
+TCE_filt17 <- TCE_filt[8001:8500,]
+TCE_filt18 <- TCE_filt[8501:9000,]
+TCE_filt19 <- TCE_filt[9001:9500,]
+TCE_filt20 <- TCE_filt[9501:10000,]
+TCE_filt21 <- TCE_filt[10001:10500,]
+TCE_filt22 <- TCE_filt[10501:11000,]
+TCE_filt23 <- TCE_filt[11001:11500,]
+TCE_filt24 <- TCE_filt[11501:12000,]
+TCE_filt25 <- TCE_filt[12001:12091,]
+
+write_csv(TCE_filt1, file = 'TCE_filt1', col_names = FALSE)
+write_csv(TCE_filt2, file = 'TCE_filt2', col_names = FALSE)
+write_csv(TCE_filt3, file = 'TCE_filt3', col_names = FALSE)
+write_csv(TCE_filt4, file = 'TCE_filt4', col_names = FALSE)
+write_csv(TCE_filt5, file = 'TCE_filt5', col_names = FALSE)
+write_csv(TCE_filt6, file = 'TCE_filt6', col_names = FALSE)
+write_csv(TCE_filt7, file = 'TCE_filt7', col_names = FALSE)
+write_csv(TCE_filt8, file = 'TCE_filt8', col_names = FALSE)
+write_csv(TCE_filt9, file = 'TCE_filt9', col_names = FALSE)
+write_csv(TCE_filt10, file = 'TCE_filt10', col_names = FALSE)
+write_csv(TCE_filt11, file = 'TCE_filt11', col_names = FALSE)
+write_csv(TCE_filt12, file = 'TCE_filt12', col_names = FALSE)
+write_csv(TCE_filt13, file = 'TCE_filt13', col_names = FALSE)
+write_csv(TCE_filt14, file = 'TCE_filt14', col_names = FALSE)
+write_csv(TCE_filt15, file = 'TCE_filt15', col_names = FALSE)
+write_csv(TCE_filt16, file = 'TCE_filt16', col_names = FALSE)
+write_csv(TCE_filt17, file = 'TCE_filt17', col_names = FALSE)
+write_csv(TCE_filt18, file = 'TCE_filt18', col_names = FALSE)
+write_csv(TCE_filt19, file = 'TCE_filt19', col_names = FALSE)
+write_csv(TCE_filt20, file = 'TCE_filt20', col_names = FALSE)
+write_csv(TCE_filt21, file = 'TCE_filt21', col_names = FALSE)
+write_csv(TCE_filt22, file = 'TCE_filt22', col_names = FALSE)
+write_csv(TCE_filt23, file = 'TCE_filt23', col_names = FALSE)
+write_csv(TCE_filt24, file = 'TCE_filt24', col_names = FALSE)
+write_csv(TCE_filt25, file = 'TCE_filt25', col_names = FALSE)
+```
+
+Lo que devuelven las consultas no son los archivos FITS, sino archivos TXT con URLs para su descarga. Una vez que tenemos descargados los 26 archivos TXT con sus URL, los unimos en un único archivo TXT y se lo pasamos al siguiente bucle.
+
+```{r eval = FALSE}
+library(parallel)
+library(doParallel)
+
+clusters <- detectCores() - 1
+make_cluster <- makeCluster(clusters)
+registerDoParallel(make_cluster)
+
+# Directorio donde se encuentran los archivos de texto con las URLs
+dir <- "/Users/leztin/Library/Mobile Documents/com~apple~CloudDocs/Universidad/Máster/TFM/Archivo completo de todas las URL"
+
+# Obtener la lista de archivos de texto en el directorio
+txt_files <- list.files(dir, pattern = "*.txt")
+
+# Bucle para iterar sobre cada archivo de texto
+for (file in txt_files) {
+  
+  # Ruta completa del archivo de texto
+  txt_file_path <- paste0(dir, "/", file)
+  
+  # Leer el archivo de texto y obtener las URLs
+  urls <- scan(txt_file_path, what = "character")
+  
+  # Bucle para iterar sobre cada URL y descargar el archivo correspondiente
+  for (i in 1:length(urls)) {
+    url <- urls[i]
+    filename <- paste0("/Users/leztin/Documentos/Curvas de luz/", basename(url))
+    download.file(url, destfile = filename)
+  }
+}
+
+# Finalizamos clusters
+stopCluster(make_cluster)
+registerDoSEQ()
+```
+
+Este bucle recorre cada una de los URL del archivo TXT y va descargando y almacenando cada uno de los archivos FITS en una carpeta. En total se deberán descargar en torno a 215 000 archivos FITS, aproximadamente 17 para cada una de las 12 669 estrellas. La descarga tardó varios días y ocupa en disco unos 120 GB.
+
+En las descargas también se incluyeron las curvas de luz de corto alcance. Estas series temporales se enfocan únicamente al TCE en vez de a todo el recorrido orbital de los potenciales planetas que orbiten una estrella. Para el análisis emplearemos seguramente las curvas de luz de largo alcance, por lo que separaremos manualmente los archivos FITS de largo alcance de los de corto alcance.
+
+```{r eval = FALSE}
+# Obtener la lista de archivos FITS en la carpeta
+files <- list.files(path = "/Users/leztin/Documentos/Curvas de luz", pattern = "\\.fits$", full.names = TRUE)
+
+# Leer y agrupar los datos según los 13 primeros caracteres del nombre del archivo
+data_by_prefix <- split(files, substr(basename(files), 1, 13))
+```
+
+Primera versión sin contabilización de trimestres:
+
+```{r eval = FALSE}
+library(parallel)
+library(doParallel)
+
+clusters <- detectCores() - 1
+make_cluster <- makeCluster(clusters)
+registerDoParallel(make_cluster)
+
+for (i in seq_along(data_by_prefix)) {
+  df <- data.frame()  # Crear un data frame vacío para almacenar los datos
+  
+  for (n in seq_along(data_by_prefix[[i]])) {
+    data <- readFrameFromFITS(as_tibble(data_by_prefix[[i]])$value[n])
+    df <- rbind(df, data)
+    
+    if (n == length(data_by_prefix[[i]])) {  # Verificar si se alcanzó el límite de n
+      filename <- file.path("/Users/leztin/Documentos/Datos/", paste0(names(data_by_prefix[i]), ".csv")) # Crear el nombre del archivo CSV
+      write.csv(df, filename, row.names = FALSE)  # Guardar el data frame en un archivo CSV
+      df <- data.frame()  # Crear un data frame vacío para almacenar los datos del siguiente i
+    }
+  }
+}
+
+# Finalizamos clusters
+stopCluster(make_cluster)
+registerDoSEQ()
+```
+
+Segunda versión con contador de trimestres:
+
+```{r eval = FALSE}
+library(parallel)
+library(doParallel)
+
+clusters <- detectCores() - 1
+make_cluster <- makeCluster(clusters)
+registerDoParallel(make_cluster)
+
+for (i in seq_along(data_by_prefix)) {
+  df <- data.frame(Trimestre = integer(), x = numeric(), y = numeric())  # Crear un data frame con una columna que contabilice los trimestres
+  
+  for (n in seq_along(data_by_prefix[[i]])) {
+    data <- readFrameFromFITS(as_tibble(data_by_prefix[[i]])$value[n])
+    data$Trimestre <- n  # Agregar la columna contador que indica el número del archivo FITS
+    df <- rbind(df, data)
+    
+    if (n == length(data_by_prefix[[i]])) {  # Verificar si se alcanzó el límite de n
+      filename <- file.path("/Users/leztin/Documentos/Datos2/", paste0(names(data_by_prefix[i]), ".csv")) # Crear el nombre del archivo CSV
+      write.csv(df, filename, row.names = FALSE)  # Guardar el data frame en un archivo CSV
+      df <- data.frame(Trimestre = integer(), x = numeric(), y = numeric())  # Crear un data frame con columna que contabilice los trimestres
+    }
+  }
+}
+
+# Finalizamos clusters
+stopCluster(make_cluster)
+registerDoSEQ()
+```
+
+Tercera versión con columna mediana:
+
+```{r eval = FALSE}
+library(parallel)
+library(doParallel)
+
+clusters <- detectCores() - 1
+make_cluster <- makeCluster(clusters)
+registerDoParallel(make_cluster)
+
+for (i in seq_along(data_by_prefix)) {
+  df <- data.frame(Trimestre = integer(), x = numeric(), y = numeric(), PDCSAP_FLUX_median = numeric())  # Crear un data frame con columna Trimestre y PDCSAP_FLUX_median para almacenar los datos
+  
+  for (n in seq_along(data_by_prefix[[i]])) {
+    data <- readFrameFromFITS(as_tibble(data_by_prefix[[i]])$value[n])
+    data$Trimestre <- n  # Agregar la columna Trimestre que indica el número del archivo FITS
+    mediana <- median(data$PDCSAP_FLUX[!is.na(data$PDCSAP_FLUX)])  # Calcular la mediana de PDCSAP_FLUX excluyendo los valores nulos
+    data$PDCSAP_FLUX_median <- data$PDCSAP_FLUX / mediana  # Calcular la columna PDCSAP_FLUX_median dividiendo PDCSAP_FLUX por la mediana
+    df <- rbind(df, data)
+    
+    if (n == length(data_by_prefix[[i]])) {  # Verificar si se alcanzó el límite de n
+      filename <- file.path("/Users/leztin/Documentos/Datos - Nuevo/", paste0(names(data_by_prefix[i]), ".csv")) # Crear el nombre del archivo CSV
+      write.csv(df, filename, row.names = FALSE)  # Guardar el data frame en un archivo CSV
+      df <- data.frame(Trimestre = integer(), x = numeric(), y = numeric(), PDCSAP_FLUX_median = numeric())  # Crear un data frame con columna contador y PDCSAP_FLUX_median vacías para almacenar los datos del siguiente i
+    }
+  }
+}
+
+# Finalizamos clusters
+stopCluster(make_cluster)
+registerDoSEQ()
+```
+
+Una vez descargados todos los archivos, pasaremos a unir los trimestres de cada estrella en una serie temporal para cada estrella que abarque los cuatro años en los que estuvo activo Kepler. En total deberán resultar 12 669 series temporales (una por estrella o KepID).
+
+Para ello, se agruparon los archivos FITS según los 13 primeros caracteres del nombre del archivo (la parte que corresponde al KepID) y se almacenaron en un vector. Este vector se pasó a un bucle para que fuera transformando los archivos FITS del mismo nombre a un dataframe y uniera automaticamente los que tuvieran el mismo nombre (pertenecieran a la misma estrella). En el bucle se han incorporado también dos nuevas variables: un contador que registra el trimestre al que pertenecen los registros del brillo en el nuevo CSV, y la variable PDCSAP_FLUX dividida entre la mediana de cada trimestre. Se ha decidido incorporar esta última variable porque cada segmento trimestral está en una escala diferente, es una manera de estandarizar y suavizar el recorrido de cada serie temporal.
+
+## Representaciones finales de las curvas de luz: estrella 11442793 con exoplaneta confirmado Kepler-90g (neptuno caliente) de la constelación Draco
+
+A continuación se muestra un ejemplo de estrella con exoplaneta confirmado e identificado. Se trata de la estrella 11442793, Kepler-90 o KOI-351. El exoplaneta se trata de un neptuno caliente con denominación Kepler-90g descubierto en 2013, y se ubica en la constelación Draco. 
+
+```{r}
+df <- 
+  read_csv(file = "/Users/leztin/Desktop/Prueba/kplr011442793.csv")
+head(df)
+```
+
+Cada archivo FITS dispone de dos variables que recogen el brillo de la estrella en dos formatos diferentes: SAP_FLUX y PDCSAP_FLUX. Los registros directos de Kepler, sin procesar, se almacenaban directamente en la variable SAP_FLUX. La variable PDCSAP_FLUX es el resultado de la aplicación de un *pipeline* determinado por parte de la NASA para evitar alteraciones en la medición provocadas por factores como temblores, cambios de temperatura, variaciones en la velocidad del propio satélite, etc.
+
+```{r}
+# Representación de la versión sin procesar del registro del brillo del cuarto trimestre para la estrella 11442793 (SAP_FLUX)
+df |> 
+  filter(contador == 4) |> 
+  ggplot(aes(x = TIME, y = SAP_FLUX)) +
+  geom_point(size = 0.5) +
+  theme_minimal()
+
+# Representación de la versión procesada por la NASA del registro del brillo del cuarto trimestre para la estrella 11442793 (PDCSAP_FLUX)
+df |> 
+  filter(contador == 4) |> 
+  ggplot(aes(x = TIME, y = PDCSAP_FLUX)) +
+  geom_point(size = 0.5) +
+  theme_minimal()
+```
+
+A continuación se muestra la vista global y local de las curvas de luz para la estrella Kepler-90. La vista global se correspondería con todos los (aproximadamente) 17 trimestres unidos, y la vista local con el TCE para el cuarto trimestre. En la vista local de esta estrella se identifica perfectamente el descenso en la luminosidad provocado por el tránsito del exoplaneta Kepler-90g. Es un ejemplo perfecto de planeta confirmado. 
+
+Por otro lado, si observamos la vista global de todos los trimestres, podremos observar dos tipos distintos de descensos en el brillo: uno primero más profundo y con un periodo orbital aparentemente mayor, y uno segundo menos profundo y con mayor cadencia. Estos serían los TCEs de los planetas Kepler-90g y Kepler-90h, este último con una distancia a su estrella y un periodo orbital similar al de la Tierra.
+
+```{r}
+# Vista global de todos los trimestres. La variable PDCSAP_FLUX se ha dividido entre la mediana de cada trimestre, ya que cada segmento trimestral está en una escala distinta
+ggplot(df, aes(x = TIME, y = flux_mediana)) +
+  geom_point(size = 0.5) +
+  theme_minimal()
+
+# Vista local del cuarto trimestre
+df |> 
+  filter(contador == 4) |> 
+  ggplot(aes(x = TIME, y = PDCSAP_FLUX)) +
+  geom_point(size = 0.5) +
+  theme_minimal()
+```
+
+# Preprocesado de las curvas de luz
+
+## Eliminación de la tendencia natural de la estrella a partir de splines
+
+## Tratamiento de valores outliers
+
+## Normalización de los datos
+
+## Compactación de la curva e interpolación de valores nulos
+
+## Uniformación de las longitudes del total de curvas de luz
