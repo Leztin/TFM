@@ -1,4 +1,4 @@
-## TFM - Aplicación de técnicas de _Deep Learning_ para la búsqueda e identificación de exoplanetas a través del método del tránsito astronómico
+## Aplicación de técnicas de _Deep Learning_ para la búsqueda e identificación de exoplanetas a través del método del tránsito astronómico
 
 Un exoplaneta, también conocido como planeta extrasolar, es un planeta que orbita una estrella más allá de nuestro sistema solar. La existencia de estos planetas se conjeturó durante siglos pero no fue hasta la década de los 90 cuando se confirmó la existencia del primero. Desde entonces, el interés de la comunidad científica por encontrar nuevos planetas dentro de la zona de habitabili- dad estelar no ha dejado de aumentar, propiciando el desarrollo de técnicas que permiten detectar con mayores garantías la presencia de estos objetos astronómicos situados a años luz de la Tierra.
 
